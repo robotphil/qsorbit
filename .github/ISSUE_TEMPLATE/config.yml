@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and feature discussions
+    url: https://github.com/QSOrbit/qsorbit/discussions
+    about: Ask questions, share ideas, or talk through proposals before opening an issue.
+  - name: Security vulnerability
+    url: https://github.com/QSOrbit/.github/blob/main/SECURITY.md
+    about: Please don't open a public issue for security problems. See the policy for how to report them privately.
