@@ -24,7 +24,9 @@ classifiers = [
     "Topic :: Communications :: Ham Radio",
     "Topic :: Scientific/Engineering :: Astronomy",
 ]
-dependencies = []
+dependencies = [
+    "pyserial>=3.5",
+]
 
 [dependency-groups]
 dev = [
