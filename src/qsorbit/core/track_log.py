@@ -65,11 +65,17 @@ class TrackLog:
             column restarts in the middle and nothing says so.
     """
 
-    def __init__(self, path: Path | str) -> None:
+    def __init__(self, path: Path | str, *, preamble_comment: str | None = None) -> None:
         self._path = Path(path)
         self._handle = None
         self._writer: csv.writer = None  # type: ignore[valid-type]
         self._rows = 0
+        # Written as a leading ``# ...`` line before the header, for a run
+        # that must not be mistaken for a normal one -- a simulated-clock
+        # pass, above all. Default ``None`` means a real run writes exactly
+        # what it always has, so nothing downstream changes; a reader that
+        # wants the rows skips any leading ``#`` line.
+        self._preamble_comment = preamble_comment
 
     @property
     def path(self) -> Path:
@@ -89,6 +95,8 @@ class TrackLog:
         # \r\r\n.
         self._handle = self._path.open("w", newline="", encoding="utf-8")
         self._writer = csv.writer(self._handle)
+        if self._preamble_comment is not None:
+            self._handle.write(f"# {self._preamble_comment}\n")
         self._writer.writerow(CSV_COLUMNS)
         self._handle.flush()
 
