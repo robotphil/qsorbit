@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -73,7 +74,25 @@ IQ_FORMAT_DESCRIPTION: str = "raw uint8 interleaved I/Q (I,Q,I,Q...), offset bin
 #: :meth:`~qsorbit.core.sdr.device.AppliedSettings.offset_from` and the
 #: bench analysis code, both of which ask "where in this capture does
 #: the station appear".
-SIDECAR_VERSION: int = 1
+#:
+#: Version 2 **adds** two keys and changes no existing one, so it is a
+#: superset of v1 — a v1 reader ignores the additions and a v2 reader
+#: fills them in from ``captured_utc`` when absent (a v1 file's start is
+#: ``captured_utc − seconds``, the derivation Session 22 already relies
+#: on). The additions exist for replay:
+#:
+#: - ``started_utc`` — the capture's **start**, to the millisecond.
+#:   ``captured_utc`` is the *end* (stamped after the write loop), and a
+#:   replay driving a Doppler curve needs the epoch of the first sample,
+#:   not the last. Recorded rather than re-derived so the next reader is
+#:   told the truth instead of computing ``end − seconds`` and hoping the
+#:   duration was honest.
+#: - ``first_block_monotonic_s`` — the monotonic-clock reading captured
+#:   at the first block. Two dongles share no wall clock, so aligning a
+#:   dual capture means pairing each branch's ``started_utc`` with a
+#:   monotonic reference taken at the same instant. This is that
+#:   reference; on a single capture it is informational.
+SIDECAR_VERSION: int = 2
 
 
 @dataclass(frozen=True)
@@ -130,6 +149,7 @@ def capture_to_file(
     block_bytes: int = DEFAULT_READ_BYTES,
     queue_blocks: int = DEFAULT_QUEUE_BLOCKS,
     captured_at: datetime | None = None,
+    started_at: datetime | None = None,
 ) -> CaptureResult:
     """Configure ``device``, capture ``seconds`` of IQ, and write it out.
 
@@ -158,8 +178,13 @@ def capture_to_file(
             intent gets written down.
         block_bytes: Bytes per read. See :class:`~qsorbit.core.sdr.stream.IqStream`.
         queue_blocks: Buffer depth in blocks.
-        captured_at: Timestamp for the sidecar. Defaults to now;
+        captured_at: End timestamp for the sidecar (``captured_utc``,
+            stamped when the write loop finishes). Defaults to now;
             injectable so tests can assert exact metadata.
+        started_at: Start timestamp for the sidecar (``started_utc``).
+            Defaults to the wall clock at the first block — the epoch of
+            the first sample, which is what a replay's Doppler curve
+            needs. Injectable so tests can assert exact metadata.
 
     Returns:
         Where things went and how the run behaved. **Check
@@ -183,9 +208,17 @@ def capture_to_file(
     sidecar_path = iq_path.with_suffix(".json")
 
     written = 0
+    first_block_monotonic: float | None = None
     stream = IqStream(device, block_bytes=block_bytes, queue_blocks=queue_blocks)
     with iq_path.open("wb") as handle, stream:
         for block in stream.blocks():
+            if first_block_monotonic is None:
+                # Stamp the start at the first real samples, so the two
+                # references (wall + monotonic) mark the same instant —
+                # sample zero — rather than the moment configure() returned.
+                first_block_monotonic = time.monotonic()
+                if started_at is None:
+                    started_at = datetime.now(UTC)
             remaining = target_bytes - written
             if len(block) >= remaining:
                 handle.write(block[:remaining])
@@ -195,6 +228,11 @@ def capture_to_file(
             written += len(block)
     stats = stream.stats
 
+    # A capture that produced no blocks has no honest start instant; fall
+    # back so the sidecar still carries a value rather than null.
+    if started_at is None:
+        started_at = captured_at or datetime.now(UTC)
+
     metadata = _build_metadata(
         applied=applied,
         stats=stats,
@@ -203,6 +241,8 @@ def capture_to_file(
         station_hz=station_hz,
         device_description=device.info.describe() if device.info else "unknown device",
         captured_at=captured_at or datetime.now(UTC),
+        started_at=started_at,
+        first_block_monotonic_s=first_block_monotonic,
     )
     sidecar_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 
@@ -215,6 +255,17 @@ def capture_to_file(
     )
 
 
+def _iso_ms(when: datetime) -> str:
+    """Format an instant as ISO-8601 UTC to millisecond precision.
+
+    ``captured_utc`` is second-precision; ``started_utc`` is not, because
+    aligning two dongles that share no clock turns on sub-second honesty
+    (the live pairing was measured at ≤1.0 ms). Assumes ``when`` is UTC,
+    the same assumption ``captured_utc`` already makes.
+    """
+    return when.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
 def _build_metadata(
     *,
     applied: AppliedSettings,
@@ -224,6 +275,8 @@ def _build_metadata(
     station_hz: float | None,
     device_description: str,
     captured_at: datetime,
+    started_at: datetime,
+    first_block_monotonic_s: float | None,
 ) -> dict[str, object]:
     """Assemble the sidecar contents.
 
@@ -234,7 +287,13 @@ def _build_metadata(
     metadata: dict[str, object] = {
         "sidecar_version": SIDECAR_VERSION,
         "format": IQ_FORMAT_DESCRIPTION,
+        # started_utc (start) before captured_utc (end): a replay reads
+        # the start to set its epoch, and the pair reads naturally in
+        # order. first_block_monotonic_s is the alignment reference for a
+        # dual capture; null only on a capture that produced no blocks.
+        "started_utc": _iso_ms(started_at),
         "captured_utc": captured_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "first_block_monotonic_s": first_block_monotonic_s,
         "device": device_description,
         "requested_center_hz": requested.center_hz,
         "actual_center_hz": applied.center_hz,
