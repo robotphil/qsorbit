@@ -105,3 +105,24 @@ class TestReporting:
         log.open()
         log.close()
         log.close()
+
+
+class TestPreambleComment:
+    """A run that must not be mistaken for a normal one marks itself."""
+
+    def test_a_preamble_comment_precedes_the_header(self, tmp_path):
+        path = tmp_path / "t.csv"
+        with TrackLog(path, preamble_comment="SIMULATED pass: not live") as log:
+            log.record(0.0, TARGET, POSITION, "commanded")
+        lines = path.read_text(encoding="utf-8").splitlines()
+        assert lines[0] == "# SIMULATED pass: not live"
+        assert lines[1] == ",".join(CSV_COLUMNS)
+
+    def test_no_comment_by_default_leaves_the_format_unchanged(self, tmp_path):
+        # A real run writes exactly what it always has -- the header
+        # first, no leading comment -- so nothing downstream changes.
+        path = tmp_path / "t.csv"
+        with TrackLog(path) as log:
+            log.record(0.0, TARGET, POSITION)
+        lines = path.read_text(encoding="utf-8").splitlines()
+        assert lines[0] == ",".join(CSV_COLUMNS)

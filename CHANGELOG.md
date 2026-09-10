@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `shell --at <time>` simulates a pass at a chosen time: the rotor follows a real satellite's geometry as if it were then, so you can check how it tracks — or compare tracking profiles — without waiting for a live pass to come round. Rotor-only, past or future. The run is marked SIMULATED on screen, in the track log, and in the closing report, so its data can't be mistaken for a live pass.
 - `TrackingLoop`, which watches a target continuously and commands the rotor to follow it, re-commanding only once the pointing error exceeds a deadband so it doesn't chatter the antenna in place. Bench-verified tracking the sun on real hardware for 20 minutes with only 2 commands issued.
 - Below-horizon targets are now handled as a normal tracking state rather than an error — the loop keeps sampling and simply commands nothing until the target rises.
 - A live readout window showing the sky target and the rotor's actual axis position as distinct values, updating roughly once a second while a track runs. Its time row shows the local system clock alongside UTC, so there's no mental time-zone math while watching a pass.

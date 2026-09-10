@@ -111,7 +111,13 @@ from qsorbit.core.sdr import (
 from qsorbit.core.stall_guard import StallGuard
 from qsorbit.core.station import ConfigError, SdrBranch, StationConfig, load_station_config
 from qsorbit.core.track_log import TrackLog
-from qsorbit.core.tracker import Pass, Satellite, TrackerError, predict_passes
+from qsorbit.core.tracker import (
+    ObserverLocation,
+    Pass,
+    Satellite,
+    TrackerError,
+    predict_passes,
+)
 from qsorbit.core.tracking_profile import (
     DESIGN_RATE_DEG_S,
     NOMINAL_TRACKING_RATE_DEG_S,
@@ -535,6 +541,18 @@ def _add_shell_command(subcommands: argparse._SubParsersAction) -> None:
         ),
     )
     _add_radio_arguments(shell, required=False)
+    shell.add_argument(
+        "--at",
+        default=None,
+        metavar="TIME",
+        help=(
+            "Simulate a pass at this ISO 8601 time instead of tracking in real "
+            "time: the rotor follows the target's geometry as if it were then, so "
+            "you can check rotor behaviour without waiting for a live pass. Past "
+            "or future. Rotor-only -- cannot be combined with --downlink (simulate "
+            "the signal with a replay instead)."
+        ),
+    )
 
 
 def _add_radio_arguments(parser: argparse.ArgumentParser, *, required: bool) -> None:
@@ -2227,6 +2245,30 @@ def _command_shell(
                 file=sys.stderr,
             )
             return 1
+    simulated_at = None
+    if args.at is not None:
+        if args.downlink is not None:
+            print(
+                "shell: --at is rotor-only and cannot be combined with --downlink. "
+                "It simulates the pass geometry for the rotor to follow; a live "
+                "radio would still be receiving now, so its Doppler would be "
+                "computed for a time the signal is not at. Simulate the signal with "
+                "a replay instead.",
+                file=sys.stderr,
+            )
+            return 1
+        if args.tle is None or not args.send:
+            print(
+                "shell: --at needs --tle and --send -- it simulates a pass for the "
+                "rotor to follow, and without them there is nothing to point at.",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            simulated_at = _parse_time(args.at)
+        except ValueError as exc:
+            print(f"shell: {exc}", file=sys.stderr)
+            return 1
     if args.tle is None:
         if args.downlink is not None or args.send:
             print(
@@ -2245,7 +2287,7 @@ def _command_shell(
                 file=sys.stderr,
             )
             return 1
-        return _run_shell_tracking_only(args, config, rotor_factory)
+        return _run_shell_tracking_only(args, config, rotor_factory, simulated_at=simulated_at)
 
     if args.gain is None and not args.auto_gain:
         print(
@@ -2405,7 +2447,11 @@ def _run_shell_alone(args: argparse.Namespace, config: StationConfig) -> int:
 
 
 def _run_shell_tracking_only(
-    args: argparse.Namespace, config: StationConfig, rotor_factory: RotorFactory
+    args: argparse.Namespace,
+    config: StationConfig,
+    rotor_factory: RotorFactory,
+    *,
+    simulated_at: datetime | None = None,
 ) -> int:
     """The shell with a rotor and no radio.
 
@@ -2434,11 +2480,36 @@ def _run_shell_tracking_only(
     app = QApplication.instance() or QApplication([])
     themes = _shell_theme(args)
 
+    # --at: run the pointing job against a shifted clock so the rotor
+    # follows a chosen pass without waiting for it. The clock drives the
+    # loop's target computation only; TrackingThread still schedules in
+    # real time, so the pass unfolds over its real duration. Marked
+    # loudly here, in the track log, and in the closing report, because a
+    # simulated run that reads as a live one is the "reports state it
+    # does not own" failure at the level of the whole run.
+    now_fn = None
+    track_marker = None
+    if simulated_at is not None:
+        now_fn = _offset_clock(simulated_at)
+        offset_s = (simulated_at - datetime.now(UTC)).total_seconds()
+        print(
+            f"*** SIMULATED PASS: clock set to {simulated_at.isoformat()} "
+            f"({offset_s:+.0f} s from now). The geometry and the rotor motion are "
+            "real; the time is not. This is NOT a live pass. ***"
+        )
+        note = _below_horizon_note(satellite, config.observer, simulated_at, args.at)
+        if note is not None:
+            print(note, file=sys.stderr)
+        track_marker = (
+            f"SIMULATED pass: clock set to {simulated_at.isoformat()} at launch; not a live pass"
+        )
+
     with _Connected(config, rotor_factory) as rotor:
         print(f"Rotor:     connected, {rotor.firmware_version}")
         profile = _tracking_profile(args, config)
         print(_describe_cadence(profile))
         _push_profile_gains(rotor, profile, config)
+        loop_clock = {"now": now_fn} if now_fn is not None else {}
         loop = TrackingLoop(
             satellite,
             config.observer,
@@ -2450,8 +2521,13 @@ def _run_shell_tracking_only(
             profile=profile,
             on_stall=_report_stall,
             on_profile_change=_profile_pusher(rotor, config),
+            **loop_clock,
         )
-        track_log = TrackLog(args.track_log) if args.track_log is not None else None
+        track_log = (
+            TrackLog(args.track_log, preamble_comment=track_marker)
+            if args.track_log is not None
+            else None
+        )
         if track_log is not None:
             track_log.open()
         # The ticker is built BEFORE the hub, because the hub needs its
@@ -2499,6 +2575,8 @@ def _run_shell_tracking_only(
     print()
     print(ticker.describe())
     _print_track_log(ticker, track_log)
+    if simulated_at is not None:
+        print("(SIMULATED pass -- the clock was offset; the timing above is not live.)")
     return 0
 
 
@@ -2850,6 +2928,62 @@ def _open_sdr(config: StationConfig, branch: SdrBranch | None = None) -> RtlSdr:
 def _report_homing_wait(elapsed_s: float) -> None:
     """Say something while the controller is deaf, so it doesn't look hung."""
     print(f"Waiting for the controller ({elapsed_s:.0f}s) - it is deaf while homing.")
+
+
+def _below_horizon_note(
+    satellite: Satellite,
+    observer: ObserverLocation,
+    simulated_at: datetime,
+    at_arg: str,
+) -> str | None:
+    """Warn if a simulated target starts below the horizon, else ``None``.
+
+    Extracted from :func:`_run_shell_tracking_only` (which needs Qt) so
+    this check runs under a plain unit test. The version this replaces
+    read ``state.elevation`` and crashed: elevation lives on
+    ``state.sky_position`` (an :class:`~qsorbit.core.geometry.AzEl`), the
+    same access the ``describe`` command uses. Below the horizon the loop
+    commands nothing until the satellite rises, so the operator gets told
+    rather than watching a still rotor and wondering.
+
+    Args:
+        satellite: The target whose geometry is being simulated.
+        observer: The station location the elevation is measured from.
+        simulated_at: The clock instant the run is pinned to at launch.
+        at_arg: The raw ``--at`` string, echoed into the suggested
+            ``plan`` command so the hint is copy-pasteable.
+
+    Returns:
+        The warning to print to stderr, or ``None`` if the target is at
+        or above the horizon.
+    """
+    elevation = satellite.topocentric_state(observer, simulated_at).sky_position.elevation
+    if elevation >= 0.0:
+        return None
+    return (
+        f"Note: {satellite.name} is below the horizon at the simulated time "
+        f"(elevation {elevation:.1f} deg), so nothing is commanded until it "
+        f"rises. Pick an --at during a pass; `qsorbit plan --at {at_arg}` shows "
+        "what is up then."
+    )
+
+
+def _offset_clock(simulated_at: datetime) -> Callable[[], datetime]:
+    """A wall clock shifted so it reads ``simulated_at`` at first call.
+
+    The offset is fixed when this is built, so the returned clock
+    advances at real time from the simulated instant -- a pass unfolds
+    over its real duration, just shifted in when it happens. ``shell
+    --at`` uses it to drive the tracking loop's target computation while
+    the tick scheduling stays on the real clock, so the rotor follows a
+    chosen pass without waiting for it to come round.
+    """
+    offset = simulated_at - datetime.now(UTC)
+
+    def _now() -> datetime:
+        return datetime.now(UTC) + offset
+
+    return _now
 
 
 def _parse_time(text: str | None) -> datetime:

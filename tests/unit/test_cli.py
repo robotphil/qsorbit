@@ -12,6 +12,7 @@ import argparse
 import json
 import signal
 import textwrap
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -22,13 +23,16 @@ from qsorbit.__main__ import (
     DEFAULT_PLAN_HOURS,
     DEFAULT_TUNING_OFFSET_KHZ,
     UNNAMED_BRANCH_LABEL,
+    _below_horizon_note,
     _build_branches,
     _build_selector,
     _command_receive,
+    _command_shell,
     _declared_branches,
     _describe_mechanics,
     _listening_index,
     _note_single_device,
+    _offset_clock,
     _open_quieting_log,
     _open_sdr,
     _parse_audio_device,
@@ -2675,3 +2679,105 @@ class TestWindowTitleWithACombiner:
             assert _window_title(SimpleNamespace(name="AO-91"), session) == (
                 "QSOrbit - receiving AO-91"
             )
+
+
+class TestSimulatedPass:
+    """`shell --at` simulates a pass for the rotor without waiting for one."""
+
+    def test_the_parser_accepts_at_on_the_shell(self):
+        args = build_parser().parse_args(
+            ["shell", "--tle", "x", "--send", "--at", "2026-09-10T08:44:00+00:00"]
+        )
+        assert args.at == "2026-09-10T08:44:00+00:00"
+
+    def test_at_defaults_to_none(self):
+        args = build_parser().parse_args(["shell", "--tle", "x", "--send"])
+        assert args.at is None
+
+    def test_at_refuses_a_live_downlink(self, capsys):
+        # Geometry is simulated by the clock; signal is simulated by
+        # replay. A live radio at a simulated time would compute Doppler
+        # for a time the signal is not at, so the combination is refused.
+        args = SimpleNamespace(
+            track_log=None, at="2026-09-10T08:44:00Z", downlink=145.9, tle="x", send=True
+        )
+        code = _command_shell(args, MagicMock(), MagicMock(), MagicMock())
+        assert code == 1
+        assert "rotor-only" in capsys.readouterr().err
+
+    def test_at_needs_tle_and_send(self, capsys):
+        args = SimpleNamespace(
+            track_log=None, at="2026-09-10T08:44:00Z", downlink=None, tle="x", send=False
+        )
+        code = _command_shell(args, MagicMock(), MagicMock(), MagicMock())
+        assert code == 1
+        assert "--at needs --tle and --send" in capsys.readouterr().err
+
+    def test_offset_clock_reads_the_simulated_time_and_advances(self):
+        from datetime import UTC, datetime, timedelta
+
+        future = datetime.now(UTC) + timedelta(hours=5)
+        clock = _offset_clock(future)
+        assert abs((clock() - future).total_seconds()) < 2.0
+
+        first = clock()
+        time.sleep(0.02)
+        assert clock() > first
+
+    def test_offset_clock_handles_a_past_time(self):
+        from datetime import UTC, datetime, timedelta
+
+        past = datetime.now(UTC) - timedelta(days=1)
+        clock = _offset_clock(past)
+        assert abs((clock() - past).total_seconds()) < 2.0
+
+    # --- below-horizon note (the Qt-gated seam, extracted so it can be
+    # unit-tested; the version this replaces read state.elevation, which
+    # does not exist, and crashed only on a real --at run) ---
+
+    @staticmethod
+    def _fake_satellite(elevation_deg: float, *, name: str = "AO-73"):
+        """A satellite stub whose topocentric elevation is fixed.
+
+        Exercises _below_horizon_note without skyfield: it only touches
+        ``.name`` and ``state.sky_position.elevation``, the exact surface
+        the crash was on.
+        """
+
+        state = SimpleNamespace(sky_position=SimpleNamespace(elevation=elevation_deg))
+        return SimpleNamespace(
+            name=name,
+            topocentric_state=lambda observer, when: state,
+        )
+
+    def test_below_horizon_note_is_none_when_the_target_is_up(self):
+        from datetime import UTC, datetime
+
+        sat = self._fake_satellite(12.3)
+        note = _below_horizon_note(
+            sat, MagicMock(), datetime(2026, 9, 10, 8, 44, tzinfo=UTC), "2026-09-10T08:44:00Z"
+        )
+        assert note is None
+
+    def test_below_horizon_note_is_none_exactly_at_the_horizon(self):
+        from datetime import UTC, datetime
+
+        sat = self._fake_satellite(0.0)
+        note = _below_horizon_note(
+            sat, MagicMock(), datetime(2026, 9, 10, 8, 44, tzinfo=UTC), "2026-09-10T08:44:00Z"
+        )
+        assert note is None
+
+    def test_below_horizon_note_warns_when_the_target_is_down(self):
+        from datetime import UTC, datetime
+
+        sat = self._fake_satellite(-7.5, name="AO-73")
+        note = _below_horizon_note(
+            sat, MagicMock(), datetime(2026, 9, 10, 8, 44, tzinfo=UTC), "2026-09-10T08:44:00Z"
+        )
+        assert note is not None
+        assert "AO-73" in note
+        assert "below the horizon" in note
+        assert "-7.5 deg" in note
+        # The suggested command echoes the raw --at value verbatim.
+        assert "qsorbit plan --at 2026-09-10T08:44:00Z" in note
