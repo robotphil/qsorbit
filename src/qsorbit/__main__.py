@@ -109,6 +109,7 @@ from qsorbit.core.sdr import (
     capture_to_file,
     index_for_serial,
 )
+from qsorbit.core.sdr.replay import ReplaySdr
 from qsorbit.core.stall_guard import StallGuard
 from qsorbit.core.station import ConfigError, SdrBranch, StationConfig, load_station_config
 from qsorbit.core.track_log import TrackLog
@@ -751,6 +752,20 @@ def _add_radio_arguments(parser: argparse.ArgumentParser, *, required: bool) -> 
         ),
     )
     parser.add_argument(
+        "--replay",
+        default=None,
+        metavar="LABEL=FILE.iq[,LABEL=FILE.iq]",
+        help=(
+            "Replay a captured .iq through the real receive path instead of "
+            "opening a radio, matching each branch by its config label - or a "
+            "bare FILE.iq for a single unnamed branch. The replay reports what "
+            "the file's sidecar says (a 1.024 Msps capture replays as 1.024 "
+            "even on a 2.048 station) and runs in real time, so audio plays "
+            "and the gate reacts as on the night. A diagnostic: it needs a "
+            "capture, which only --record-iq makes."
+        ),
+    )
+    parser.add_argument(
         "--theme",
         metavar="SLUG",
         default=DEFAULT_THEME_NAME,
@@ -972,10 +987,19 @@ def main(
             return _command_status(config, factory)
         if args.command == "sdr":
             return _command_sdr(args, config, sdr_factory or _open_sdr)
+        replay_factory: SdrFactory | None = None
+        if args.command in ("receive", "shell") and getattr(args, "replay", None):
+            try:
+                replay_factory = _replay_sdr_factory(_parse_replay_map(args.replay))
+            except ValueError as exc:
+                print(f"{args.command}: {exc}", file=sys.stderr)
+                return 1
         if args.command == "receive":
-            return _command_receive(args, config, factory, sdr_factory or _open_sdr)
+            return _command_receive(
+                args, config, factory, sdr_factory or replay_factory or _open_sdr
+            )
         if args.command == "shell":
-            return _command_shell(args, config, factory, sdr_factory or _open_sdr)
+            return _command_shell(args, config, factory, sdr_factory or replay_factory or _open_sdr)
         return _command_stop(config, factory)
     except HomingError as exc:
         # Its own state rather than a generic failure: nothing sent over
@@ -1892,6 +1916,7 @@ def _build_branches(
     window: bool,
     log: QuietingLog | None = None,
     record_dir: Path | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> list[Branch]:
     """Turn configured radios into receive branches.
 
@@ -1926,7 +1951,10 @@ def _build_branches(
     station_hz = args.downlink * 1e6 if args.downlink is not None else None
     branches: list[Branch] = []
     for index, radio in enumerate(radios):
-        stream = IqStream(radio.sdr)
+        # On a replay, every branch's stream reads the capture's clock, so
+        # block timestamps run at the capture's date; live runs pass None
+        # and IqStream keeps its own wall clock.
+        stream = IqStream(radio.sdr, now=clock) if clock is not None else IqStream(radio.sdr)
         recorder_factory = (
             _iq_recorder_factory(radio, record_dir, station_hz, stream)
             if record_dir is not None
@@ -1967,10 +1995,18 @@ def _run_receive(
     ticker = TrackingThread(loop, log=track_log) if loop is not None else None
     quieting_log = _open_quieting_log(args)
     record_dir = Path(args.record_iq) if args.record_iq is not None else None
+    replay_clock = _replay_clock_for(radios, listening)
+    _print_replay_banner(radios)
 
     session = ReceiveSession(
         branches=_build_branches(
-            args, radios, listening, window=args.window, log=quieting_log, record_dir=record_dir
+            args,
+            radios,
+            listening,
+            window=args.window,
+            log=quieting_log,
+            record_dir=record_dir,
+            clock=replay_clock,
         ),
         audio=AudioOutput(
             radios[listening].nbfm.audio_rate_hz, device=_parse_audio_device(args.audio_device)
@@ -1978,8 +2014,9 @@ def _run_receive(
         # Always from the target, never from the rotor. A range rate
         # comes from the TLE and the observer's location; taking it from
         # a rotor tick was what made the rotor follow this cadence
-        # instead of its own profile's.
-        range_rate=TargetRangeRate(satellite, config.observer),
+        # instead of its own profile's. On a replay it reads the capture's
+        # clock, so the Doppler curve runs at the capture's date.
+        range_rate=_range_rate_source(satellite, config.observer, replay_clock),
         listening=listening,
         selector=_build_selector(args),
         tracking_interval_s=_range_rate_interval(args),
@@ -2749,17 +2786,25 @@ def _run_shell(
     ticker = TrackingThread(loop, log=track_log) if loop is not None else None
     quieting_log = _open_quieting_log(args)
     record_dir = Path(args.record_iq) if args.record_iq is not None else None
+    replay_clock = _replay_clock_for(radios, listening)
+    _print_replay_banner(radios)
     session = ReceiveSession(
         # window=True unconditionally here, unlike `receive`, where it
         # follows --window: a shell always has a Radio tab, so there is
         # always something that would drain the frames.
         branches=_build_branches(
-            args, radios, listening, window=True, log=quieting_log, record_dir=record_dir
+            args,
+            radios,
+            listening,
+            window=True,
+            log=quieting_log,
+            record_dir=record_dir,
+            clock=replay_clock,
         ),
         audio=AudioOutput(
             radios[listening].nbfm.audio_rate_hz, device=_parse_audio_device(args.audio_device)
         ),
-        range_rate=TargetRangeRate(satellite, config.observer),
+        range_rate=_range_rate_source(satellite, config.observer, replay_clock),
         listening=listening,
         selector=_build_selector(args),
         tracking_interval_s=_range_rate_interval(args),
@@ -2990,6 +3035,99 @@ def _note_single_device(config: StationConfig) -> None:
         f"Note: {len(config.sdr.branches)} branches are declared and this command "
         f"opens one. Using {branch.label} (serial {branch.serial})."
     )
+
+
+def _parse_replay_map(spec: str) -> dict[str | None, str]:
+    """Parse ``--replay`` into a map of branch label to ``.iq`` path.
+
+    ``LABEL=FILE,LABEL=FILE`` maps by label; a bare ``FILE`` (no ``=``)
+    maps the single unnamed branch, keyed by ``None``. Mixing the two, an
+    empty spec, or a half-written entry is a usage error rather than a
+    guess.
+    """
+    entries = [part.strip() for part in spec.split(",") if part.strip()]
+    mapping: dict[str | None, str] = {}
+    for entry in entries:
+        if "=" in entry:
+            label, _, path = entry.partition("=")
+            if not label.strip() or not path.strip():
+                raise ValueError(f"--replay entry {entry!r} must be LABEL=FILE.iq.")
+            mapping[label.strip()] = path.strip()
+        else:
+            mapping[None] = entry
+    if not mapping:
+        raise ValueError("--replay needs at least one FILE.iq.")
+    if None in mapping and len(mapping) > 1:
+        raise ValueError(
+            "--replay: give one bare FILE.iq for a single unnamed branch, or "
+            "LABEL=FILE.iq per branch, but not both."
+        )
+    return mapping
+
+
+def _replay_sdr_factory(replay_map: dict[str | None, str]) -> SdrFactory:
+    """An :data:`SdrFactory` that returns a :class:`ReplaySdr` per branch.
+
+    Matches each branch by its config label (``None`` for a single
+    unnamed branch); a branch with no file in the map is refused rather
+    than opened as a live radio, so a typo can't quietly half-replay.
+    """
+
+    def factory(config: StationConfig, branch: SdrBranch | None = None) -> RtlSdr:
+        key = branch.label if branch is not None else None
+        if key not in replay_map:
+            declared = ", ".join(sorted(k for k in replay_map if k is not None)) or "a bare file"
+            raise SdrError(f"--replay has no file for branch {key!r}; it maps: {declared}.")
+        return ReplaySdr(replay_map[key])
+
+    return factory
+
+
+def _replay_clock_for(radios: Sequence[_Radio], listening: int) -> Callable[[], datetime] | None:
+    """The shared capture-epoch clock for a replay run, or ``None`` if live.
+
+    Taken from the listening branch's :class:`ReplaySdr`, so block
+    timestamps and the Doppler curve run at the capture's date. One clock
+    for the whole session -- two branches replaying the same file then
+    stamp identical timestamps, which is the identical-input control's
+    whole premise.
+    """
+    device = radios[listening].sdr
+    if isinstance(device, ReplaySdr):
+        return device.capture_clock()
+    return None
+
+
+def _range_rate_source(
+    satellite: Satellite, observer: ObserverLocation, clock: Callable[[], datetime] | None
+) -> TargetRangeRate:
+    """The range-rate source, reading a replay's clock when one is given.
+
+    A live run uses the wall clock; a replay uses the capture's, so the
+    Doppler curve is computed for the pass that was recorded rather than
+    for whenever the replay happens to run.
+    """
+    if clock is not None:
+        return TargetRangeRate(satellite, observer, now=clock)
+    return TargetRangeRate(satellite, observer)
+
+
+def _print_replay_banner(radios: Sequence[_Radio]) -> None:
+    """Announce a replay run and what each file actually is, if replaying."""
+    replays = [radio for radio in radios if isinstance(radio.sdr, ReplaySdr)]
+    if not replays:
+        return
+    print(
+        "*** REPLAY: reading captured IQ, not a live receive. Rate and tuning "
+        "come from each file's own sidecar. ***"
+    )
+    for radio in replays:
+        applied = radio.sdr.applied
+        if applied is not None:
+            print(
+                f"    {radio.label}: {applied.sample_rate_hz / 1e6:.3f} Msps, "
+                f"centre {applied.center_hz / 1e6:.4f} MHz"
+            )
 
 
 def _open_sdr(config: StationConfig, branch: SdrBranch | None = None) -> RtlSdr:

@@ -36,6 +36,7 @@ from qsorbit.__main__ import (
     _open_quieting_log,
     _open_sdr,
     _parse_audio_device,
+    _parse_replay_map,
     _print_quieting_log,
     _print_recordings,
     _profile_pusher,
@@ -44,6 +45,8 @@ from qsorbit.__main__ import (
     _range_rate_interval,
     _readout_poll_interval_ms,
     _receive_shell_hub,
+    _replay_clock_for,
+    _replay_sdr_factory,
     _sdr_ppm,
     _spectrum_factory,
     _squelch_status_line,
@@ -64,8 +67,10 @@ from qsorbit.core.sdr import (
     DeviceError,
     DeviceInfo,
     DeviceNotFoundError,
+    SdrError,
     TunerType,
 )
+from qsorbit.core.sdr.replay import ReplaySdr
 from qsorbit.core.station import load_station_config
 from qsorbit.ui.theme import DEFAULT_THEME_NAME, DEFAULT_THEMES_DIR, discover_themes
 
@@ -2685,6 +2690,71 @@ class TestRecordIqWiring:
         assert "A - Arrow V" in out
         assert "A-Arrow-V.iq" in out
         assert "2,048 bytes" in out
+
+
+class TestReplayWiring:
+    """``--replay`` maps captured files to branches at the SdrFactory seam."""
+
+    def test_a_bare_file_maps_the_unnamed_branch(self):
+        assert _parse_replay_map("cap.iq") == {None: "cap.iq"}
+
+    def test_labelled_entries_map_by_label(self):
+        got = _parse_replay_map("A - Arrow V=a.iq, B - Arrow H=b.iq")
+
+        assert got == {"A - Arrow V": "a.iq", "B - Arrow H": "b.iq"}
+
+    def test_mixing_a_bare_file_and_labels_is_refused(self):
+        with pytest.raises(ValueError, match="not both"):
+            _parse_replay_map("a.iq, B - Arrow H=b.iq")
+
+    def test_a_half_written_entry_is_refused(self):
+        with pytest.raises(ValueError, match="LABEL=FILE"):
+            _parse_replay_map("A - Arrow V=")
+
+    def test_an_empty_spec_is_refused(self):
+        with pytest.raises(ValueError, match="at least one"):
+            _parse_replay_map("   ")
+
+    def test_the_factory_returns_a_replay_for_a_matching_branch(self):
+        factory = _replay_sdr_factory({"A - Arrow V": "a.iq"})
+
+        device = factory(object(), SimpleNamespace(label="A - Arrow V"))
+
+        assert isinstance(device, ReplaySdr)
+        assert device.iq_path.name == "a.iq"
+
+    def test_the_factory_maps_the_unnamed_branch_from_a_bare_file(self):
+        factory = _replay_sdr_factory({None: "cap.iq"})
+
+        device = factory(object(), None)
+
+        assert isinstance(device, ReplaySdr)
+        assert device.iq_path.name == "cap.iq"
+
+    def test_the_factory_refuses_an_unmapped_branch(self):
+        # A typo'd label must not quietly fall through to opening a radio.
+        factory = _replay_sdr_factory({"A - Arrow V": "a.iq"})
+
+        with pytest.raises(SdrError, match="no file for branch"):
+            factory(object(), SimpleNamespace(label="B - Arrow H"))
+
+    def test_the_flag_defaults_to_off(self, tle_path):
+        assert receive_args(tle_path).replay is None
+
+    def test_the_shell_takes_it_too(self):
+        # Both commands run the same receive path, so the flag lives on both.
+        args = build_parser().parse_args(
+            ["shell", "--tle", "x", "--downlink", "145.95", "--gain", "32.8", "--replay", "cap.iq"]
+        )
+
+        assert args.replay == "cap.iq"
+
+    def test_a_live_run_has_no_replay_clock(self):
+        # _replay_clock_for returns a clock only when the listening branch is
+        # a replay; an ordinary radio run keeps IqStream's own wall clock.
+        radios = [SimpleNamespace(sdr=object())]
+
+        assert _replay_clock_for(radios, 0) is None
 
 
 class TestCombinerFlags:
