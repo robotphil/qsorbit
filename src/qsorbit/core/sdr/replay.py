@@ -39,6 +39,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import numpy as np
+
 from qsorbit.core.sdr.device import DEFAULT_READ_BYTES, AppliedSettings, DeviceInfo
 from qsorbit.core.sdr.exceptions import DeviceError
 from qsorbit.core.sdr.librtlsdr import TunerType
@@ -46,6 +48,29 @@ from qsorbit.core.sdr.stream import byte_rate_for
 
 if TYPE_CHECKING:
     from qsorbit.core.sdr.config import SdrConfig
+
+#: The zero point of offset-binary uint8 IQ: 127.5, halfway between 127
+#: and 128. Attenuation scales samples toward this point.
+_IQ_ZERO = 127.5
+
+
+def _attenuate(block: bytes, gain: float) -> bytes:
+    """Scale offset-binary uint8 IQ toward its zero point by ``gain``.
+
+    ``gain`` is a linear amplitude factor (``10 ** (-dB / 20)``); a gain of
+    1.0 (0 dB) is a no-op and returns the block untouched. A gain below 1
+    pulls every sample toward 127.5 and re-quantises to uint8 -- so a
+    strong attenuation crushes the signal into the quantisation floor,
+    which is what makes one branch reliably the worse of an otherwise
+    identical pair. A synthetic control instrument, not a physical model
+    of a pad: FM demodulation is amplitude-invariant, so the degradation
+    is the re-quantisation, and it bites only at large dB.
+    """
+    if gain >= 1.0:
+        return block
+    samples = np.frombuffer(block, dtype=np.uint8).astype(np.float64)
+    scaled = _IQ_ZERO + (samples - _IQ_ZERO) * gain
+    return np.clip(np.round(scaled), 0, 255).astype(np.uint8).tobytes()
 
 
 def _parse_iso_z(text: str) -> datetime:
@@ -92,12 +117,18 @@ class ReplaySdr:
         iq_path: str | Path,
         *,
         index: int = 0,
+        attenuation_db: float = 0.0,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._iq_path = Path(iq_path)
         self._sidecar_path = self._iq_path.with_suffix(".json")
         self._index = index
+        # Stored as a linear amplitude factor; 0 dB is 1.0, a no-op. Used by
+        # the known-answer control to make one branch of an otherwise
+        # identical pair the definite loser -- see _attenuate.
+        self._attenuation_db = attenuation_db
+        self._gain = 10.0 ** (-attenuation_db / 20.0)
         self._sleep = sleep
         self._monotonic = monotonic
         self._meta: dict[str, object] | None = None
@@ -122,6 +153,11 @@ class ReplaySdr:
     def iq_path(self) -> Path:
         """The captured ``.iq`` this instance replays."""
         return self._iq_path
+
+    @property
+    def attenuation_db(self) -> float:
+        """The attenuation applied to this branch, in dB (0.0 = none)."""
+        return self._attenuation_db
 
     @property
     def is_open(self) -> bool:
@@ -245,7 +281,7 @@ class ReplaySdr:
         actual_elapsed = self._monotonic() - self._start_monotonic
         if target_elapsed > actual_elapsed:
             self._sleep(target_elapsed - actual_elapsed)
-        return block
+        return _attenuate(block, self._gain)
 
     # ------------------------------------------------------------------
     # The capture clock

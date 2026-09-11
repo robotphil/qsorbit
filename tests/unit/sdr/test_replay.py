@@ -182,3 +182,40 @@ class TestCaptureClock:
 
         assert clock() == datetime(2026, 9, 6, 8, 44, 0, tzinfo=UTC)
         assert clock() == datetime(2026, 9, 6, 8, 44, 5, tzinfo=UTC)
+
+
+class TestAttenuation:
+    def _read(self, tmp_path, payload, **overrides):
+        replay = ReplaySdr(a_capture(tmp_path, iq=payload), sleep=lambda s: None, **overrides)
+        replay.open()
+        replay.configure(a_config())
+        return replay
+
+    def test_zero_db_is_a_no_op(self, tmp_path):
+        payload = bytes(range(256)) * 2  # 512 bytes
+        replay = self._read(tmp_path, payload)
+
+        assert replay.attenuation_db == 0.0
+        assert replay.read_raw(512) == payload[:512]
+
+    def test_attenuation_pulls_samples_toward_the_zero_point(self, tmp_path):
+        # 20 dB is a linear gain of 0.1 about 127.5: 255 -> 140, 0 -> 115.
+        payload = bytes([0, 255]) * 256
+        replay = self._read(tmp_path, payload, attenuation_db=20.0)
+
+        out = replay.read_raw(512)
+
+        assert replay.attenuation_db == 20.0
+        assert out[0] == 115
+        assert out[1] == 140
+
+    def test_strong_attenuation_crushes_toward_the_centre(self, tmp_path):
+        # 40 dB (gain 0.01) leaves every sample within a couple of LSB of
+        # the 127.5 zero point -- the quantisation floor the known-answer
+        # control relies on to make one branch the definite loser.
+        payload = bytes([0, 255]) * 256
+        replay = self._read(tmp_path, payload, attenuation_db=40.0)
+
+        out = replay.read_raw(512)
+
+        assert all(126 <= sample <= 129 for sample in out)
