@@ -24,6 +24,21 @@ including the **actual** centre frequency and sample rate reported by the
 device rather than the requested ones — the tuner PLL and sample clock both
 quantise, and spectrum arithmetic must use the actual values.
 
+The sidecar carries a `sidecar_version`. **Version 2** adds two timing keys
+to version 1 and changes no existing key, so it is a superset — a v1 file is
+still readable, and a reader fills the additions in from `captured_utc` when
+they are absent:
+
+- `started_utc` — the capture's **start**, to the millisecond. `captured_utc`
+  is the *end* (stamped after the write loop), so anything that needs the
+  epoch of the first sample — a replay driving a Doppler curve — reads
+  `started_utc`, or derives it as `captured_utc − seconds` for a v1 file.
+- `first_block_monotonic_s` — a monotonic-clock reading taken at the first
+  block. Two dongles share no wall clock, so a dual capture is aligned by
+  pairing each branch's `started_utc` with a monotonic reference at the same
+  instant; on a single capture this is informational. `null` only if the
+  capture produced no blocks.
+
 ## Expected fixtures
 
 | File | Signal | Purpose |

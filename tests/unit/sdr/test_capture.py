@@ -15,6 +15,7 @@ the same thing.
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, datetime
 
 import pytest
@@ -273,6 +274,38 @@ class TestSidecarRecordsWhatHappened:
 
         assert meta["captured_utc"] == "2026-08-22T14:30:00Z"
 
+    def test_the_schema_version_is_two(self, tmp_path):
+        # The v2 bump is deliberate (started_utc + first_block_monotonic_s);
+        # pin the literal so an accidental change to the constant fails here
+        # as well as the constant-based test above.
+        assert SIDECAR_VERSION == 2
+        assert self.sidecar(tmp_path)["sidecar_version"] == 2
+
+    def test_it_records_a_start_time_distinct_from_the_end(self, tmp_path):
+        # captured_utc is the end; started_utc is the start. On a real
+        # (fast) capture they are close, but both keys must be present and
+        # the start carries millisecond precision the end does not.
+        meta = self.sidecar(tmp_path)
+
+        assert "started_utc" in meta
+        assert "captured_utc" in meta
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z", meta["started_utc"])
+
+    def test_the_start_time_can_be_pinned_to_the_millisecond(self, tmp_path):
+        meta = self.sidecar(
+            tmp_path, started_at=datetime(2026, 9, 6, 8, 44, 0, 123_000, tzinfo=UTC)
+        )
+
+        assert meta["started_utc"] == "2026-09-06T08:44:00.123Z"
+
+    def test_it_records_a_first_block_monotonic_reference(self, tmp_path):
+        # The alignment reference for a dual capture: a monotonic reading
+        # taken at the first block. On a single capture it is only
+        # informational, but it must be a real number, not null.
+        meta = self.sidecar(tmp_path)
+
+        assert isinstance(meta["first_block_monotonic_s"], float)
+
 
 class TestContiguity:
     def test_an_uninterrupted_capture_is_marked_contiguous(self, tmp_path):
@@ -305,6 +338,8 @@ class TestContiguity:
             station_hz=None,
             device_description="RTL-SDR Blog V4",
             captured_at=datetime(2026, 8, 22, 14, 30, 0, tzinfo=UTC),
+            started_at=datetime(2026, 8, 22, 14, 29, 58, tzinfo=UTC),
+            first_block_monotonic_s=123.5,
         )
 
         assert meta["contiguous"] is False
@@ -321,6 +356,8 @@ class TestContiguity:
             station_hz=None,
             device_description="RTL-SDR Blog V4",
             captured_at=datetime(2026, 8, 22, 14, 30, 0, tzinfo=UTC),
+            started_at=datetime(2026, 8, 22, 14, 29, 58, tzinfo=UTC),
+            first_block_monotonic_s=123.5,
         )
 
         assert meta["contiguous"] is True
