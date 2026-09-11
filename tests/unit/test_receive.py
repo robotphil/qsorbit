@@ -32,10 +32,12 @@ than one it waits for.
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -50,11 +52,13 @@ from qsorbit.core.pointing import TravelGuardError
 from qsorbit.core.quieting_log import QuietingLog
 from qsorbit.core.receive import (
     AUDIO_SUBSCRIBER,
+    RECORDER_SUBSCRIBER,
     WATERFALL_SUBSCRIBER,
     Branch,
     ReceiveSession,
     TargetRangeRate,
 )
+from qsorbit.core.recorder import IqRecorder
 from qsorbit.core.sdr import AppliedSettings, DeviceError, IqStream, SdrConfig
 from qsorbit.core.tracker.state import TopocentricState
 
@@ -323,6 +327,7 @@ def a_session(
         "mute_squelch",
         "spectrum_factory",
         "log",
+        "recorder_factory",
     }
     branch_overrides = {k: v for k, v in overrides.items() if k in branch_keys}
     session_overrides = {k: v for k, v in overrides.items() if k not in branch_keys}
@@ -521,6 +526,84 @@ class TestSessionWiring:
 
         with pytest.raises(ValueError, match="tracking_interval_s"):
             a_session(device, source, tracking_interval_s=0.0)
+
+
+def a_recorder_factory(tmp_path, *, label: str = "A"):
+    """A recorder factory writing to ``tmp_path/<label>.iq``, loss faked.
+
+    The loss source is a stand-in: the file-writing is the subject here,
+    not the loss value (that is asserted in ``test_iq_recorder``).
+    """
+
+    def factory(subscription):
+        return IqRecorder(
+            subscription=subscription,
+            iq_path=tmp_path / f"{label}.iq",
+            applied=applied_settings(),
+            device_description="fake device",
+            station_hz=None,
+            loss_source=lambda: SimpleNamespace(lost_bytes=0.0, loss_fraction=0.0),
+            label=label,
+        )
+
+    return factory
+
+
+class TestRecorder:
+    """``--record-iq`` rides on the branch as one more consumer; the
+    session owns the thread that drains it to disk."""
+
+    def test_a_branch_has_no_recorder_without_a_factory(self):
+        branch = a_branch(SteppedFakeDevice([TUNING_OFFSET_HZ]))
+
+        assert branch.recorder is None
+
+    def test_a_branch_builds_its_recorder_on_the_recorder_subscription(self):
+        captured = {}
+        sentinel = object()
+
+        def factory(subscription):
+            captured["name"] = subscription.name
+            return sentinel
+
+        branch = a_branch(SteppedFakeDevice([TUNING_OFFSET_HZ]), recorder_factory=factory)
+
+        assert branch.recorder is sentinel
+        assert captured["name"] == RECORDER_SUBSCRIBER
+
+    def test_the_recorder_subscription_is_made_only_when_recording(self):
+        device = SteppedFakeDevice([TUNING_OFFSET_HZ])
+        source = ScriptedRangeRate([(AN_INSTANT, -3.0)])
+        session, _ = a_session(device, source, recorder_factory=lambda subscription: object())
+
+        names = [entry.name for entry in session.stats.branches[0].stream.subscribers]
+
+        assert RECORDER_SUBSCRIBER in names
+
+    def test_a_run_records_iq_and_writes_a_v2_sidecar(self, tmp_path):
+        device = SteppedFakeDevice([TUNING_OFFSET_HZ] * 3)
+        source = ScriptedRangeRate([(AN_INSTANT, 0.0)])
+        session, audio = a_session(device, source, recorder_factory=a_recorder_factory(tmp_path))
+
+        session.start()
+        try:
+            for _ in range(3):
+                device.step()
+            assert audio.wait_for(3), "not every block was demodulated"
+        finally:
+            device.finish()
+            assert session.wait(5.0), "the demodulating thread never noticed the stream ending"
+            with pytest.raises(DeviceError, match="exhausted"):
+                session.stop()
+
+        iq_path = tmp_path / "A.iq"
+        sidecar_path = tmp_path / "A.json"
+        assert iq_path.is_file() and iq_path.stat().st_size > 0
+        meta = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        assert meta["sidecar_version"] == 2
+        # Every byte that reached the recorder is on disk and counted: the
+        # file and its own sidecar agree on the size.
+        assert meta["bytes"] == iq_path.stat().st_size
 
 
 class TestDemodulation:

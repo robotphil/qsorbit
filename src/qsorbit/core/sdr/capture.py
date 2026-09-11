@@ -266,10 +266,9 @@ def _iso_ms(when: datetime) -> str:
     return when.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
-def _build_metadata(
+def build_sidecar(
     *,
     applied: AppliedSettings,
-    stats: StreamStats,
     written: int,
     seconds: float,
     station_hz: float | None,
@@ -277,11 +276,26 @@ def _build_metadata(
     captured_at: datetime,
     started_at: datetime,
     first_block_monotonic_s: float | None,
+    blocks_dropped: int,
+    estimated_lost_bytes: int,
+    loss_fraction: float,
 ) -> dict[str, object]:
-    """Assemble the sidecar contents.
+    """Assemble the sidecar contents from primitives.
 
-    Separate from the writing so its shape can be asserted in a unit
-    test without touching a filesystem or a device.
+    Shared by :func:`capture_to_file` and the in-session
+    :class:`~qsorbit.core.recorder.IqRecorder`, so both write a
+    byte-identical v2 sidecar and there is one format with one place to
+    test it -- the ``_receive_shell_hub`` lesson, applied to a file
+    format instead of a widget.
+
+    Decoupled from :class:`~qsorbit.core.sdr.stream.StreamStats` on
+    purpose: the recorder's own buffer drops come from its per-consumer
+    subscription while a capture reads the whole stream, so each caller
+    passes the loss numbers that are true for it rather than a stats
+    object that means something different in the two cases.
+
+    Separate from the writing, too, so its shape can be asserted in a
+    unit test without touching a filesystem or a device.
     """
     requested = applied.requested
     metadata: dict[str, object] = {
@@ -307,10 +321,10 @@ def _build_metadata(
         "bytes": written,
         # Contiguity first among the quality keys: it is the one that
         # decides whether this file is fit to be a fixture.
-        "contiguous": stats.blocks_dropped == 0,
-        "blocks_dropped": stats.blocks_dropped,
-        "estimated_lost_bytes": round(stats.loss.lost_bytes),
-        "loss_fraction": stats.loss.loss_fraction,
+        "contiguous": blocks_dropped == 0,
+        "blocks_dropped": blocks_dropped,
+        "estimated_lost_bytes": estimated_lost_bytes,
+        "loss_fraction": loss_fraction,
     }
     if station_hz is not None:
         metadata["station_hz"] = station_hz
@@ -319,3 +333,37 @@ def _build_metadata(
         # 'tuning_offset_hz' key - see SIDECAR_VERSION.
         metadata["station_offset_hz"] = applied.offset_from(station_hz)
     return metadata
+
+
+def _build_metadata(
+    *,
+    applied: AppliedSettings,
+    stats: StreamStats,
+    written: int,
+    seconds: float,
+    station_hz: float | None,
+    device_description: str,
+    captured_at: datetime,
+    started_at: datetime,
+    first_block_monotonic_s: float | None,
+) -> dict[str, object]:
+    """Adapt a capture's whole-stream :class:`StreamStats` to
+    :func:`build_sidecar`.
+
+    Kept as capture's own entry point so ``capture_to_file`` and its
+    tests keep their ``StreamStats``-shaped call, while
+    :func:`build_sidecar` carries the format the recorder shares.
+    """
+    return build_sidecar(
+        applied=applied,
+        written=written,
+        seconds=seconds,
+        station_hz=station_hz,
+        device_description=device_description,
+        captured_at=captured_at,
+        started_at=started_at,
+        first_block_monotonic_s=first_block_monotonic_s,
+        blocks_dropped=stats.blocks_dropped,
+        estimated_lost_bytes=round(stats.loss.lost_bytes),
+        loss_fraction=stats.loss.loss_fraction,
+    )
