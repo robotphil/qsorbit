@@ -37,6 +37,7 @@ from qsorbit.__main__ import (
     _open_sdr,
     _parse_audio_device,
     _print_quieting_log,
+    _print_recordings,
     _profile_pusher,
     _push_profile_gains,
     _quit_on_sigint,
@@ -2590,6 +2591,100 @@ class TestQuietingLogWiring:
         _print_quieting_log(log)
 
         assert "q.csv" in capsys.readouterr().out
+
+
+class TestRecordIqWiring:
+    """``--record-iq`` gives every branch a recorder writing into DIR."""
+
+    def branches_with(self, tmp_path, tle_path, *extra, record_dir=None):
+        def run(args, config, satellite, radios, listening, *, loop=None):
+            run.branches = _build_branches(
+                args, radios, listening, window=False, record_dir=record_dir
+            )
+            return 0
+
+        run.branches = None
+        _command_receive(
+            receive_args(tle_path, *extra),
+            config_with(tmp_path, TWO_BRANCHES),
+            None,
+            branch_sdr_factory(),
+            runner=run,
+        )
+        return run.branches
+
+    def test_the_flag_defaults_to_off(self, tle_path):
+        assert receive_args(tle_path).record_iq is None
+
+    def test_the_shell_takes_it_too(self, tmp_path):
+        # Both commands run the same receive path, so a flag on one and not
+        # the other would be a difference with no reason behind it.
+        args = build_parser().parse_args(
+            [
+                "shell",
+                "--tle",
+                "x",
+                "--downlink",
+                "145.95",
+                "--gain",
+                "32.8",
+                "--record-iq",
+                str(tmp_path / "iq"),
+            ]
+        )
+
+        assert args.record_iq == str(tmp_path / "iq")
+
+    def test_no_record_dir_means_no_recorder_on_any_branch(self, tmp_path, tle_path):
+        branches = self.branches_with(tmp_path, tle_path)
+
+        assert [branch.recorder for branch in branches] == [None, None]
+
+    def test_a_record_dir_gives_every_branch_a_recorder(self, tmp_path, tle_path):
+        branches = self.branches_with(tmp_path, tle_path, record_dir=tmp_path / "iq")
+
+        assert all(branch.recorder is not None for branch in branches)
+
+    def test_each_recorder_is_named_for_its_antenna_filename_safe(self, tmp_path, tle_path):
+        branches = self.branches_with(tmp_path, tle_path, record_dir=tmp_path / "iq")
+
+        assert sorted(b.recorder.iq_path.name for b in branches) == [
+            "A-Arrow-V.iq",
+            "B-Arrow-H.iq",
+        ]
+        # The true label is preserved on the recorder for the report and
+        # the sidecar, even though the filename is sanitised.
+        assert sorted(b.recorder.label for b in branches) == ["A - Arrow V", "B - Arrow H"]
+
+    def test_the_shell_refuses_record_iq_without_a_downlink(self, capsys):
+        # --record-iq records a radio, and a rotor-only shell has none.
+        args = SimpleNamespace(
+            track_log=None, at=None, record_iq="iq", downlink=None, tle="x", send=True
+        )
+
+        code = _command_shell(args, MagicMock(), MagicMock(), MagicMock())
+
+        assert code == 1
+        assert "--record-iq needs --downlink" in capsys.readouterr().err
+
+    def test_the_report_says_nothing_without_a_dir_and_names_files_with_one(self, tmp_path, capsys):
+        _print_recordings(SimpleNamespace(branches=()), None)
+        assert capsys.readouterr().out == ""
+
+        recorder = SimpleNamespace(
+            label="A - Arrow V",
+            bytes_written=2048,
+            iq_path=tmp_path / "A-Arrow-V.iq",
+            sidecar_path=tmp_path / "A-Arrow-V.json",
+        )
+        session = SimpleNamespace(branches=(SimpleNamespace(recorder=recorder),))
+
+        _print_recordings(session, tmp_path)
+
+        out = capsys.readouterr().out
+        assert "A - Arrow V" in out
+        assert "A-Arrow-V.iq" in out
+        assert "2,048 bytes" in out
 
 
 class TestCombinerFlags:

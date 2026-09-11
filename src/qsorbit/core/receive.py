@@ -95,7 +95,7 @@ import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from typing import Final, Protocol
+from typing import TYPE_CHECKING, Final, Protocol
 
 import numpy as np
 
@@ -116,11 +116,21 @@ from qsorbit.core.sdr.stream import IqStream, StreamStats, TimedBlock
 from qsorbit.core.tracker.observer import ObserverLocation
 from qsorbit.core.tracker.target import Target
 
+if TYPE_CHECKING:
+    from qsorbit.core.recorder import IqRecorder
+    from qsorbit.core.sdr.stream import IqSubscription
+
 #: Subscription name for the demodulating consumer.
 AUDIO_SUBSCRIBER: Final = "audio"
 
 #: Subscription name for the spectrum/waterfall consumer.
 WATERFALL_SUBSCRIBER: Final = "waterfall"
+
+#: Subscription name for the IQ-recording consumer. Made only when a run
+#: asks to record, so an ordinary run pays nothing for a consumer that
+#: does not exist -- the same conditional-subscription discipline the
+#: waterfall follows (Session 24's phantom-drop lesson).
+RECORDER_SUBSCRIBER: Final = "recorder"
 
 #: Seconds between range-rate samples when this module drives the
 #: tracking side itself. One second matches
@@ -410,6 +420,7 @@ class Branch:
         mute_squelch: bool = True,
         spectrum_factory: Callable[[Iterable[bytes]], SpectrumStream] | None = None,
         log: QuietingLog | None = None,
+        recorder_factory: Callable[[IqSubscription], IqRecorder] | None = None,
     ) -> None:
         self.label = label
         self.listened = False
@@ -424,6 +435,17 @@ class Branch:
         # must exist before the reader thread does and a caller is
         # entitled to hold the waterfall subscription before starting.
         self._audio_blocks = stream.subscribe(AUDIO_SUBSCRIBER)
+        # The recorder is another consumer, made only when a run asks to
+        # record -- built exactly like the waterfall, and for the same
+        # reason conditional: an unused subscription would be offered every
+        # block and evict them, reporting phantom loss (Session 24). The
+        # branch makes the subscription (the stream is its own); the
+        # session owns the thread that drains it, the same split as the
+        # demodulating consumer.
+        if recorder_factory is None:
+            self._recorder = None
+        else:
+            self._recorder = recorder_factory(stream.subscribe(RECORDER_SUBSCRIBER))
         # The waterfall subscription is made only when something will
         # actually drain it. It used to be unconditional, so a headless
         # run offered every block to a consumer that did not exist and
@@ -460,6 +482,16 @@ class Branch:
     def spectrum(self) -> SpectrumStream | None:
         """This branch's spectrum stream, or ``None`` if it has none."""
         return self._spectrum
+
+    @property
+    def recorder(self) -> IqRecorder | None:
+        """This branch's IQ recorder, or ``None`` if this run records nothing.
+
+        The session runs its :meth:`~qsorbit.core.recorder.IqRecorder.run`
+        on a thread of its own -- the branch makes the subscription, the
+        session owns the thread, the standing division here.
+        """
+        return self._recorder
 
     @property
     def doppler(self) -> DopplerTracker:
@@ -761,10 +793,19 @@ class ReceiveSession:
         self._stop = threading.Event()
         self._demod_threads: list[threading.Thread] = []
         self._tracking_thread: threading.Thread | None = None
+        # One writer thread per branch that is recording. Empty on an
+        # ordinary run, so the lifecycle below is a no-op unless --record-iq
+        # gave a branch a recorder.
+        self._recorder_threads: list[threading.Thread] = []
         self._started = False
         self._error: BaseException | None = None
         # Kept apart from _error deliberately: see tracking_error().
         self._tracking_error: BaseException | None = None
+        # And apart again: a recorder that failed (a full disk, most
+        # likely) is worth raising, but not ahead of a radio that died --
+        # the demod error is the cause, a stalled recorder often the
+        # symptom.
+        self._recorder_error: BaseException | None = None
         self._stopped_cleanly = True
 
         self._lock = threading.Lock()
@@ -951,9 +992,25 @@ class ReceiveSession:
         self._tracking_thread = threading.Thread(
             target=self._tracking_loop, name="qsorbit-receive-tracking", daemon=True
         )
+        # One recorder thread per branch that is recording. Built here,
+        # after the readers exist, because the recorder drains a
+        # subscription and a subscription without a reader behind it never
+        # yields. Ordinary runs record nothing and add no threads.
+        for branch in self._branches:
+            if branch.recorder is not None:
+                self._recorder_threads.append(
+                    threading.Thread(
+                        target=self._record_loop,
+                        args=(branch,),
+                        name=f"qsorbit-receive-record-{branch.label}",
+                        daemon=True,
+                    )
+                )
         for thread in self._demod_threads:
             thread.start()
         self._tracking_thread.start()
+        for thread in self._recorder_threads:
+            thread.start()
 
     def wait(self, timeout_s: float | None = None) -> bool:
         """Block until the demodulating thread ends, or until ``timeout_s``.
@@ -1020,7 +1077,10 @@ class ReceiveSession:
             branch.stop_reading()
 
         clean = True
-        for thread in (*self._demod_threads, self._tracking_thread):
+        # Recorder threads join with the rest: each ends when its
+        # subscription drains, then writes its sidecar, so the files are
+        # complete by the time stats are built.
+        for thread in (*self._demod_threads, self._tracking_thread, *self._recorder_threads):
             if thread is not None:
                 thread.join(self._join_timeout_s)
                 clean = clean and not thread.is_alive()
@@ -1029,7 +1089,9 @@ class ReceiveSession:
         audio_stats = self._audio.stop()
         stats = self._build_stats(audio_stats)
 
-        error = self._error
+        # The demod error is the cause when both fired; a recorder error
+        # is raised only when nothing more fundamental did.
+        error = self._error or self._recorder_error
         if error is not None:
             raise error
         return stats
@@ -1176,6 +1238,24 @@ class ReceiveSession:
             # exception would be a consequence of the first.
             if self._error is None:
                 self._error = exc
+
+    def _record_loop(self, branch: Branch) -> None:
+        """Run one branch's recorder until its stream finishes.
+
+        The recorder returns of its own accord when the reader stops and
+        its queue drains, so this loop has no stop check -- the same shape
+        as a consumer that simply reads to the end. A failure (a full disk)
+        is stored, not swallowed: a recorder that stopped writing silently
+        would leave a short capture that looks whole, the exact defect
+        class this project keeps naming.
+        """
+        try:
+            recorder = branch.recorder
+            if recorder is not None:
+                recorder.run()
+        except BaseException as exc:  # noqa: BLE001 - re-raised from stop()
+            if self._recorder_error is None:
+                self._recorder_error = exc
 
     def _tracking_loop(self) -> None:
         """Feed the Doppler tracker on a cadence until asked to stop.

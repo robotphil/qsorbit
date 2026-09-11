@@ -86,6 +86,7 @@ from qsorbit.core.receive import (
     ReceiveSession,
     TargetRangeRate,
 )
+from qsorbit.core.recorder import IqRecorder, safe_filename
 from qsorbit.core.rotor import (
     HomingError,
     Position,
@@ -128,6 +129,7 @@ from qsorbit.core.tracking_thread import TrackingThread
 from qsorbit.ui.theme import DEFAULT_THEME_NAME
 
 if TYPE_CHECKING:
+    from qsorbit.core.sdr.stream import IqSubscription
     from qsorbit.ui.feed_hub import FeedHub
 
 #: How long ``point --send`` waits for the rotor to settle, in seconds.
@@ -732,6 +734,20 @@ def _add_radio_arguments(parser: argparse.ArgumentParser, *, required: bool) -> 
             "Sampling rides the thread that already owns the serial port, so "
             "it adds reads but no contention; a run without this flag pays "
             "nothing for it."
+        ),
+    )
+    parser.add_argument(
+        "--record-iq",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Record every branch's raw IQ to DIR while the pass runs: one "
+            ".iq file plus a sidecar per branch, named for the antenna. The "
+            "recorder is a consumer on each branch's stream, not a second "
+            "process, so it never contends with the demodulator for the "
+            "dongle - which is what lets a capture be made during the same "
+            "run that logs quieting and drives the rotor. Needs --downlink; "
+            "about 4 MB/s per branch, so check the disk before a long pass."
         ),
     )
     parser.add_argument(
@@ -1579,6 +1595,27 @@ def _print_quieting_log(log: QuietingLog | None) -> None:
     log.close()
 
 
+def _print_recordings(session: ReceiveSession, record_dir: Path | None) -> None:
+    """Say where each branch's IQ went, if the run was recording.
+
+    The recorders wrote their own files and sidecars as the run stopped;
+    this only reports what landed, so a capture night ends with a visible
+    confirmation of exactly which files to trim rather than a silent
+    directory the operator has to go and check.
+    """
+    if record_dir is None:
+        return
+    recorders = [branch.recorder for branch in session.branches if branch.recorder is not None]
+    if not recorders:
+        return
+    print(f"Recorded IQ to {record_dir}:")
+    for recorder in recorders:
+        print(
+            f"  {recorder.label}: {recorder.bytes_written:,} bytes "
+            f"-> {recorder.iq_path.name} (+ {recorder.sidecar_path.name})"
+        )
+
+
 def _print_track_log(ticker: TrackingThread, log: TrackLog | None) -> None:
     """Report the track log and close it, if there was one.
 
@@ -1818,6 +1855,35 @@ def _tracking_profile(args: argparse.Namespace, config: StationConfig) -> Tracki
     return profile
 
 
+def _iq_recorder_factory(
+    radio: _Radio,
+    record_dir: Path,
+    station_hz: float | None,
+    stream: IqStream,
+) -> Callable[[IqSubscription], IqRecorder]:
+    """A recorder-building closure for one radio, for :class:`Branch`.
+
+    Built here, where the device's actual settings and the downlink are
+    in hand, and applied to the branch's own recorder subscription. The
+    loss it reports at the end is the *stream's* USB loss, read when the
+    sidecar is written -- a callable, not a stored value, because that
+    number is only final once the run has stopped.
+    """
+
+    def factory(subscription: IqSubscription) -> IqRecorder:
+        return IqRecorder(
+            subscription=subscription,
+            iq_path=record_dir / (safe_filename(radio.label) + ".iq"),
+            applied=radio.applied,
+            device_description=radio.sdr.info.describe() if radio.sdr.info else "unknown device",
+            station_hz=station_hz,
+            loss_source=lambda: stream.stats.loss,
+            label=radio.label,
+        )
+
+    return factory
+
+
 def _build_branches(
     args: argparse.Namespace,
     radios: Sequence[_Radio],
@@ -1825,6 +1891,7 @@ def _build_branches(
     *,
     window: bool,
     log: QuietingLog | None = None,
+    record_dir: Path | None = None,
 ) -> list[Branch]:
     """Turn configured radios into receive branches.
 
@@ -1843,6 +1910,10 @@ def _build_branches(
         log: Optional quieting log, shared by every branch. One log and
             not one per branch, because the whole point is a difference
             between two series and two files would be two time origins.
+        record_dir: Optional directory to record every branch's raw IQ
+            into. When given, each branch takes a recorder consumer
+            writing ``<antenna>.iq`` and its sidecar; ``None`` records
+            nothing and adds no consumer, so an ordinary run is unchanged.
     """
     spectrum_config = SpectrumConfig(
         fft_size=RECEIVE_FFT_SIZE,
@@ -1850,22 +1921,34 @@ def _build_branches(
         center_freq_hz=radios[listening].applied.center_hz,
     )
     factory = _spectrum_factory(window, spectrum_config)
-    return [
-        Branch(
-            label=radio.label,
-            stream=IqStream(radio.sdr),
-            nbfm=radio.nbfm,
-            doppler=radio.doppler,
-            squelch=radio.squelch,
-            # args.squelch is "let the gate's decision reach the
-            # speaker" - the gate itself is always deciding now, see
-            # _squelch_status_line.
-            mute_squelch=args.squelch,
-            spectrum_factory=factory if index == listening else None,
-            log=log,
+    # The downlink, in Hz, so each sidecar records where in its own
+    # capture the signal sits -- the same station_hz sdr capture records.
+    station_hz = args.downlink * 1e6 if args.downlink is not None else None
+    branches: list[Branch] = []
+    for index, radio in enumerate(radios):
+        stream = IqStream(radio.sdr)
+        recorder_factory = (
+            _iq_recorder_factory(radio, record_dir, station_hz, stream)
+            if record_dir is not None
+            else None
         )
-        for index, radio in enumerate(radios)
-    ]
+        branches.append(
+            Branch(
+                label=radio.label,
+                stream=stream,
+                nbfm=radio.nbfm,
+                doppler=radio.doppler,
+                squelch=radio.squelch,
+                # args.squelch is "let the gate's decision reach the
+                # speaker" - the gate itself is always deciding now, see
+                # _squelch_status_line.
+                mute_squelch=args.squelch,
+                spectrum_factory=factory if index == listening else None,
+                log=log,
+                recorder_factory=recorder_factory,
+            )
+        )
+    return branches
 
 
 def _run_receive(
@@ -1883,9 +1966,12 @@ def _run_receive(
         track_log.open()
     ticker = TrackingThread(loop, log=track_log) if loop is not None else None
     quieting_log = _open_quieting_log(args)
+    record_dir = Path(args.record_iq) if args.record_iq is not None else None
 
     session = ReceiveSession(
-        branches=_build_branches(args, radios, listening, window=args.window, log=quieting_log),
+        branches=_build_branches(
+            args, radios, listening, window=args.window, log=quieting_log, record_dir=record_dir
+        ),
         audio=AudioOutput(
             radios[listening].nbfm.audio_rate_hz, device=_parse_audio_device(args.audio_device)
         ),
@@ -1984,6 +2070,7 @@ def _run_receive(
     print()
     print(stats.describe())
     _print_quieting_log(quieting_log)
+    _print_recordings(session, record_dir)
     if ticker is not None:
         print(ticker.describe())
         _print_track_log(ticker, track_log)
@@ -2269,6 +2356,13 @@ def _command_shell(
         except ValueError as exc:
             print(f"shell: {exc}", file=sys.stderr)
             return 1
+    if args.record_iq is not None and args.downlink is None:
+        print(
+            "shell: --record-iq needs --downlink. It records a radio's raw IQ, "
+            "and a rotor-only shell has no radio to record.",
+            file=sys.stderr,
+        )
+        return 1
     if args.tle is None:
         if args.downlink is not None or args.send:
             print(
@@ -2654,11 +2748,14 @@ def _run_shell(
         track_log.open()
     ticker = TrackingThread(loop, log=track_log) if loop is not None else None
     quieting_log = _open_quieting_log(args)
+    record_dir = Path(args.record_iq) if args.record_iq is not None else None
     session = ReceiveSession(
         # window=True unconditionally here, unlike `receive`, where it
         # follows --window: a shell always has a Radio tab, so there is
         # always something that would drain the frames.
-        branches=_build_branches(args, radios, listening, window=True, log=quieting_log),
+        branches=_build_branches(
+            args, radios, listening, window=True, log=quieting_log, record_dir=record_dir
+        ),
         audio=AudioOutput(
             radios[listening].nbfm.audio_rate_hz, device=_parse_audio_device(args.audio_device)
         ),
@@ -2729,6 +2826,7 @@ def _run_shell(
     print()
     print(stats.describe())
     _print_quieting_log(quieting_log)
+    _print_recordings(session, record_dir)
     if ticker is not None:
         print(ticker.describe())
         _print_track_log(ticker, track_log)
