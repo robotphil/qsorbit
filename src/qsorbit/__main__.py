@@ -766,6 +766,19 @@ def _add_radio_arguments(parser: argparse.ArgumentParser, *, required: bool) -> 
         ),
     )
     parser.add_argument(
+        "--replay-attenuate",
+        default=None,
+        metavar="LABEL=DB[,LABEL=DB]",
+        help=(
+            "Attenuate a replayed branch by DB decibels (or a bare DB for a "
+            "single unnamed branch). The known-answer control: feed one "
+            "capture to both branches and pad one down, and a correct "
+            "combiner must sit on the un-padded branch throughout. Needs "
+            "--replay; the effect is a re-quantisation floor, so use a large "
+            "value (20+ dB) for a decisive difference."
+        ),
+    )
+    parser.add_argument(
         "--theme",
         metavar="SLUG",
         default=DEFAULT_THEME_NAME,
@@ -990,10 +1003,18 @@ def main(
         replay_factory: SdrFactory | None = None
         if args.command in ("receive", "shell") and getattr(args, "replay", None):
             try:
-                replay_factory = _replay_sdr_factory(_parse_replay_map(args.replay))
+                attenuation = (
+                    _parse_attenuation_map(args.replay_attenuate)
+                    if getattr(args, "replay_attenuate", None)
+                    else None
+                )
+                replay_factory = _replay_sdr_factory(_parse_replay_map(args.replay), attenuation)
             except ValueError as exc:
                 print(f"{args.command}: {exc}", file=sys.stderr)
                 return 1
+        elif args.command in ("receive", "shell") and getattr(args, "replay_attenuate", None):
+            print(f"{args.command}: --replay-attenuate needs --replay.", file=sys.stderr)
+            return 1
         if args.command == "receive":
             return _command_receive(
                 args, config, factory, sdr_factory or replay_factory or _open_sdr
@@ -3065,20 +3086,56 @@ def _parse_replay_map(spec: str) -> dict[str | None, str]:
     return mapping
 
 
-def _replay_sdr_factory(replay_map: dict[str | None, str]) -> SdrFactory:
+def _parse_attenuation_map(spec: str) -> dict[str | None, float]:
+    """Parse ``--replay-attenuate`` into a map of branch label to dB.
+
+    Same shape as :func:`_parse_replay_map` -- ``LABEL=DB`` per branch, or a
+    bare ``DB`` for a single unnamed branch -- but the values are decibels,
+    and a value that is not a number is a usage error.
+    """
+    entries = [part.strip() for part in spec.split(",") if part.strip()]
+    mapping: dict[str | None, float] = {}
+    for entry in entries:
+        label: str | None
+        if "=" in entry:
+            raw_label, _, raw_db = entry.partition("=")
+            label = raw_label.strip()
+            raw_db = raw_db.strip()
+            if not label or not raw_db:
+                raise ValueError(f"--replay-attenuate entry {entry!r} must be LABEL=DB.")
+        else:
+            label, raw_db = None, entry
+        try:
+            mapping[label] = float(raw_db)
+        except ValueError:
+            raise ValueError(f"--replay-attenuate: {raw_db!r} is not a number of dB.") from None
+    if not mapping:
+        raise ValueError("--replay-attenuate needs at least one LABEL=DB.")
+    if None in mapping and len(mapping) > 1:
+        raise ValueError("--replay-attenuate: give one bare DB or LABEL=DB per branch, not both.")
+    return mapping
+
+
+def _replay_sdr_factory(
+    replay_map: dict[str | None, str],
+    attenuation_map: dict[str | None, float] | None = None,
+) -> SdrFactory:
     """An :data:`SdrFactory` that returns a :class:`ReplaySdr` per branch.
 
     Matches each branch by its config label (``None`` for a single
     unnamed branch); a branch with no file in the map is refused rather
     than opened as a live radio, so a typo can't quietly half-replay.
+    ``attenuation_map`` pads a branch down by its dB for the known-answer
+    control; a branch not in it is replayed at full amplitude.
     """
+    attenuation = attenuation_map or {}
 
     def factory(config: StationConfig, branch: SdrBranch | None = None) -> RtlSdr:
         key = branch.label if branch is not None else None
         if key not in replay_map:
             declared = ", ".join(sorted(k for k in replay_map if k is not None)) or "a bare file"
             raise SdrError(f"--replay has no file for branch {key!r}; it maps: {declared}.")
-        return ReplaySdr(replay_map[key])
+        return ReplaySdr(replay_map[key], attenuation_db=attenuation.get(key, 0.0))
 
     return factory
 

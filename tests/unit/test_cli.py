@@ -35,6 +35,7 @@ from qsorbit.__main__ import (
     _offset_clock,
     _open_quieting_log,
     _open_sdr,
+    _parse_attenuation_map,
     _parse_audio_device,
     _parse_replay_map,
     _print_quieting_log,
@@ -2755,6 +2756,40 @@ class TestReplayWiring:
         radios = [SimpleNamespace(sdr=object())]
 
         assert _replay_clock_for(radios, 0) is None
+
+
+class TestReplayAttenuation:
+    """--replay-attenuate pads a branch down for the known-answer control."""
+
+    def test_the_flag_defaults_to_off(self, tle_path):
+        assert receive_args(tle_path).replay_attenuate is None
+
+    def test_parses_a_bare_value_and_labelled_values(self):
+        assert _parse_attenuation_map("20") == {None: 20.0}
+        assert _parse_attenuation_map("A - Arrow V=20, B - Arrow H=6.5") == {
+            "A - Arrow V": 20.0,
+            "B - Arrow H": 6.5,
+        }
+
+    def test_a_non_number_is_refused(self):
+        with pytest.raises(ValueError, match="not a number"):
+            _parse_attenuation_map("A - Arrow V=loud")
+
+    def test_the_factory_applies_the_attenuation_to_the_named_branch(self):
+        factory = _replay_sdr_factory({"A - Arrow V": "a.iq"}, {"A - Arrow V": 20.0})
+
+        device = factory(object(), SimpleNamespace(label="A - Arrow V"))
+
+        assert device.attenuation_db == 20.0
+
+    def test_an_unlisted_branch_is_replayed_at_full_amplitude(self):
+        factory = _replay_sdr_factory(
+            {"A - Arrow V": "a.iq", "B - Arrow H": "b.iq"}, {"A - Arrow V": 20.0}
+        )
+
+        device = factory(object(), SimpleNamespace(label="B - Arrow H"))
+
+        assert device.attenuation_db == 0.0
 
 
 class TestCombinerFlags:

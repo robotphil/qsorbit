@@ -42,6 +42,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from qsorbit.core.combiner import DEFAULT_MARGIN_DB, BranchSelector
 from qsorbit.core.dsp.demod import NbfmConfig
 from qsorbit.core.dsp.spectrum import SpectrumConfig
 from qsorbit.core.dsp.spectrum_stream import SpectrumStream
@@ -60,6 +61,7 @@ from qsorbit.core.receive import (
 )
 from qsorbit.core.recorder import IqRecorder
 from qsorbit.core.sdr import AppliedSettings, DeviceError, IqStream, SdrConfig
+from qsorbit.core.sdr.replay import ReplaySdr
 from qsorbit.core.tracker.state import TopocentricState
 
 #: Small rates, so a "block" is a few thousand samples rather than a
@@ -1746,3 +1748,129 @@ class TestSpectrumSurvivesASwitch:
 
         assert session.spectrum is None
         assert "no waterfall was attached" in session.stats.describe()
+
+
+# ---------------------------------------------------------------------------
+# The replay controls, run through the real selector
+# ---------------------------------------------------------------------------
+
+
+def _replay_capture(tmp_path, name: str, iq: bytes):
+    """Write a synthetic .iq and its v2 sidecar under ``tmp_path``.
+
+    Dated and tuned to this module's constants so a :class:`ReplaySdr`
+    built on it drops straight into the receive harness -- the same
+    centre the branches expect, the same sample rate a block period is
+    figured from -- and two captures written from the same bytes are the
+    same sky arriving at two antennas with the propagation path removed.
+    """
+    iq_path = tmp_path / name
+    iq_path.write_bytes(iq)
+    meta = {
+        "sidecar_version": 2,
+        "format": "raw uint8 interleaved I/Q",
+        "started_utc": AN_INSTANT.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+        "captured_utc": AN_INSTANT.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "first_block_monotonic_s": 0.0,
+        "device": f"[0] replay source ({name})",
+        "requested_center_hz": CENTER_HZ,
+        "actual_center_hz": CENTER_HZ,
+        "requested_sample_rate_hz": SAMPLE_RATE_HZ,
+        "actual_sample_rate_hz": SAMPLE_RATE_HZ,
+        "gain_db": 32.8,
+        "gain_mode": "manual",
+        "ppm": 0,
+        "agc_enabled": False,
+        "seconds": len(iq) / (2.0 * SAMPLE_RATE_HZ),
+        "bytes": len(iq),
+        "contiguous": True,
+        "blocks_dropped": 0,
+        "estimated_lost_bytes": 0,
+        "loss_fraction": 0.0,
+    }
+    iq_path.with_suffix(".json").write_text(json.dumps(meta) + "\n", encoding="utf-8")
+    return iq_path
+
+
+def _open_replay(iq_path, **overrides) -> ReplaySdr:
+    """A :class:`ReplaySdr` opened and configured, its real-time pacing removed.
+
+    The sleep is a no-op so the file runs at demod speed rather than
+    pass length; the switch count the test reads does not depend on the
+    wall-clock cadence, only on the readings being identical.
+    """
+    replay = ReplaySdr(iq_path, sleep=lambda _s: None, **overrides)
+    replay.open()
+    replay.configure(SdrConfig(center_hz=CENTER_HZ, sample_rate_hz=SAMPLE_RATE_HZ, gain_db=32.8))
+    return replay
+
+
+class TestReplayControls:
+    """The acceptance controls, run offline through the *real* selector.
+
+    The counterpart to :class:`TestCombinerWiring`, which drove a *stub*
+    selector to prove the wiring. Here the real :class:`BranchSelector`
+    runs against real :class:`ReplaySdr` devices reading a file, so the
+    number a bench run reads first -- the switch count -- is the number
+    under test rather than a fixture.
+
+    Only the **identical-input** control is deterministic offline and so
+    lives here. The signal-physics controls -- the antenna swap, the
+    3-vs-20 dB pair, the known-answer attenuation -- turn on a real
+    modulated capture behaving the way a real fade does, which a
+    synthetic tone cannot stand in for; those stay desk controls run by
+    hand against ``rs44-pass.iq`` (Step 19), driven through this same
+    ``--replay`` / ``--replay-attenuate`` path.
+    """
+
+    def _six_blocks(self) -> bytes:
+        # Enough blocks that the selector is consulted several times: the
+        # first block per branch is the startup gate, so decisions accrue
+        # from the second onward.
+        return b"".join(carrier_block(TUNING_OFFSET_HZ, index) for index in range(6))
+
+    def test_identical_input_makes_no_switches(self, tmp_path):
+        # The same file into both branches is the same sky into both
+        # antennas with the path removed: the quieting difference is
+        # identically zero, so nothing ever clears the margin and the ear
+        # never moves. A switch here would mean the selector is chasing
+        # something that is not a signal difference at all.
+        payload = self._six_blocks()
+        replay_a = _open_replay(_replay_capture(tmp_path, "left.iq", payload))
+        replay_b = _open_replay(_replay_capture(tmp_path, "right.iq", payload))
+
+        # One shared capture-epoch clock stamps both branches' blocks,
+        # exactly as the live --replay path threads it, so aligned blocks
+        # reach the selector as the same moment.
+        clock = replay_a.capture_clock()
+        selector = BranchSelector(margin_db=DEFAULT_MARGIN_DB)
+        branches = [
+            a_branch(replay_a, label="A", clock=clock, squelch=NoiseSquelch()),
+            a_branch(replay_b, label="B", clock=clock, squelch=NoiseSquelch()),
+        ]
+        session = ReceiveSession(
+            branches=branches,
+            audio=RecordingAudio(),
+            range_rate=ScriptedRangeRate([(AN_INSTANT, 0.0)]),
+            selector=selector,
+            # Generous, so the brief free-running read never ages a live
+            # branch into a stop and manufactures a rule-2 handoff -- the
+            # one way identical input could ever switch.
+            stale_after_s=60.0,
+        )
+
+        session.start()
+        try:
+            assert wait_until(
+                lambda: all(branch.stats.blocks_demodulated >= 6 for branch in session.branches)
+            ), (
+                "branches reached "
+                f"{[branch.stats.blocks_demodulated for branch in session.branches]}, wanted 6"
+            )
+        finally:
+            quietly_stop(session)
+
+        combiner = session.stats.combiner
+        assert combiner is not None
+        assert combiner.evaluations > 0, "the selector was never consulted"
+        assert combiner.switches == 0
